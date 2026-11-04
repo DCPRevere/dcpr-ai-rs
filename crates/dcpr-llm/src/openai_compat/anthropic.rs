@@ -7,9 +7,28 @@ use serde_json::{Value, json};
 
 use crate::SystemPrompt;
 
-/// Haiku 5.5 rejects non-default sampling parameters.
-fn is_haiku_5_5(model: &str) -> bool {
-    model.contains("haiku-5.5") || model.contains("haiku-5-5")
+/// Claude models that reject `temperature`: Opus 4.7 and later, every 5.x
+/// model, and the `-latest` aliases, which point at them. Measured on
+/// Anthropic's API on 2026-11-04; Opus 4.6 and Sonnet 4.6 still accept it.
+pub(super) fn rejects_temperature(model: &str) -> bool {
+    let name = model.rsplit('/').next().unwrap_or(model);
+    let name = name.split(':').next().unwrap_or(name);
+    let Some(rest) = name.strip_prefix("claude-") else {
+        return false;
+    };
+    if rest.ends_with("-latest") {
+        return true;
+    }
+    // claude-<family>-<major>[-.]<minor>[-<date>]
+    let mut numbers = rest
+        .split(['-', '.'])
+        .filter_map(|part| part.parse::<u32>().ok())
+        .filter(|number| *number < 100);
+    let Some(major) = numbers.next() else {
+        return false;
+    };
+    let minor = numbers.next().unwrap_or(0);
+    (major, minor) >= (4, 7)
 }
 
 pub(super) fn is_model(model: &str) -> bool {
@@ -32,11 +51,7 @@ impl RequestPolicy {
             omit_temperature: false,
         };
         for model in candidates.filter(|model| is_model(model)) {
-            policy.omit_temperature |= is_haiku_5_5(model)
-                || model
-                    .split(':')
-                    .next()
-                    .is_some_and(|name| name.ends_with("/claude-haiku-latest"));
+            policy.omit_temperature |= rejects_temperature(model);
         }
         policy
     }
@@ -46,7 +61,7 @@ impl RequestPolicy {
             body["cache_control"] = json!({"type": "ephemeral"});
         }
         if self.omit_temperature {
-            // Haiku 5.5 rejects non-default sampling, including helper temperature 0.
+            // Opus 4.7 and later, and every 5.x model, reject any temperature.
             body.as_object_mut().unwrap().remove("temperature");
         }
     }
@@ -199,12 +214,40 @@ mod tests {
     }
 
     #[test]
-    fn sonnet_retains_sampling_and_unmarked_instructions_remain_intact() {
-        let policy = RequestPolicy::for_models("~anthropic/claude-sonnet-latest", &[]);
+    fn temperature_is_rejected_from_opus_4_7_on() {
+        for model in [
+            "claude-haiku-5-5",
+            "anthropic/claude-sonnet-5.5",
+            "claude-opus-4-7",
+            "claude-fable-5-1",
+            "~anthropic/claude-sonnet-latest",
+            "claude-opus-5:thinking",
+        ] {
+            assert!(rejects_temperature(model), "{model}");
+        }
+        for model in [
+            "claude-opus-4-6",
+            "claude-sonnet-4-6",
+            "claude-opus-4-5-20251101",
+            "gpt-6.1-sol",
+        ] {
+            assert!(!rejects_temperature(model), "{model}");
+        }
+    }
+
+    #[test]
+    fn older_claude_retains_sampling_and_unmarked_instructions_remain_intact() {
+        // Sonnet 4.6 still accepts temperature; Sonnet 5.5 (and the `-latest`
+        // alias pointing at it) rejects it on Anthropic's API.
+        let policy = RequestPolicy::for_models("anthropic/claude-sonnet-4.6", &[]);
         let mut body = json!({"temperature":0, "instructions":"unmarked", "input":[]});
         policy.apply_parameters(&mut body);
         policy.apply_responses_instructions(&mut body, "unmarked".into());
         assert_eq!(body["temperature"], 0);
+        let mut latest = json!({"temperature":0});
+        RequestPolicy::for_models("~anthropic/claude-sonnet-latest", &[])
+            .apply_parameters(&mut latest);
+        assert!(latest.get("temperature").is_none());
         assert_eq!(body["instructions"], "unmarked");
         assert_eq!(body["input"], json!([]));
     }

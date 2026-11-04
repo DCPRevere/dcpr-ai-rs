@@ -163,8 +163,11 @@ impl Error {
             && (lower.contains("openrouter_in_flight_budget")
                 || lower.contains("in_flight_budget_exhausted")
                 || lower.contains("in-flight requests"));
+        // OpenAI sends spent credit as a 429 too. Retrying cannot help.
+        let quota_exhausted = status == 429
+            && (lower.contains("insufficient_quota") || lower.contains("credit_balance_exhausted"));
         let retryable = temporary_in_flight_budget
-            || status == 429
+            || (status == 429 && !quota_exhausted)
             || status == 408
             || (500..=599).contains(&status);
         Self::Call {

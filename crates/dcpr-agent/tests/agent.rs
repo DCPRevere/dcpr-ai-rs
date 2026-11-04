@@ -456,3 +456,130 @@ async fn streaming_runs_keep_only_the_final_answer() {
     assert_eq!(run.reply, "Nothing planted yet.");
     assert_eq!(*transcript.0.lock().unwrap(), "Nothing planted yet.");
 }
+
+/// A read whose output is far larger than any context window should carry.
+struct ReadLog;
+
+#[async_trait]
+impl Tool<App> for ReadLog {
+    fn name(&self) -> &str {
+        "read_log"
+    }
+    fn description(&self) -> &str {
+        "Read the deploy log."
+    }
+    fn parameters(&self) -> Value {
+        json!({"type":"object","properties":{"page":{"type":"integer"}}})
+    }
+    async fn call(&self, _: &Mutex<Vec<String>>, args: Value) -> Result<ToolResult, String> {
+        let page = args["page"].as_u64().unwrap_or(0);
+        Ok(ToolResult::observed(format!(
+            "FIRST LINE page {page}\n{}LAST LINE page {page}",
+            "noise\n".repeat(20_000)
+        )))
+    }
+}
+
+fn results_seen(history: &[ToolTurn]) -> Vec<String> {
+    history
+        .iter()
+        .filter_map(|turn| match turn {
+            ToolTurn::ToolResults(results) => Some(results.iter().map(|(_, out)| out.clone())),
+            _ => None,
+        })
+        .flatten()
+        .collect()
+}
+
+#[tokio::test]
+async fn tool_outputs_are_capped_keeping_both_ends() {
+    let mut model = ScriptedModel::new();
+    model
+        .push_tool_call("read_log", json!({"page": 1}))
+        .push_text("The deploy log ends at page 1.");
+    let agent = ToolAgent::new("Read logs.", vec![Box::new(ReadLog) as Box<dyn Tool<App>>])
+        .with_tool_output_limit(Some(2_000));
+    let run = agent
+        .run(
+            &model,
+            "user",
+            &Mutex::new(Vec::new()),
+            vec![ToolTurn::User("Check the deploy.".into())],
+        )
+        .await
+        .unwrap();
+    // The host keeps the whole output; the model saw a capped one.
+    assert!(run.calls[0].result.for_model().len() > 100_000);
+    let seen = results_seen(&model.histories_seen()[1]);
+    // 2,000 characters of output inside the result envelope.
+    assert!(seen[0].chars().count() < 3_000, "{}", seen[0].len());
+    assert!(
+        serde_json::from_str::<Value>(&seen[0]).is_ok(),
+        "the envelope stays valid JSON"
+    );
+    assert!(seen[0].contains("FIRST LINE page 1") && seen[0].contains("LAST LINE page 1"));
+    assert!(seen[0].contains("characters omitted"));
+}
+
+#[tokio::test]
+async fn a_history_budget_keeps_the_task_while_old_results_are_condensed() {
+    let mut model = ScriptedModel::new();
+    for page in 0..6 {
+        model.push_tool_call("read_log", json!({"page": page}));
+    }
+    model.push_text("Found it.");
+    let agent = ToolAgent::new("Read logs.", vec![Box::new(ReadLog) as Box<dyn Tool<App>>])
+        .with_tool_output_limit(Some(8_000))
+        .with_history_budget(6_000);
+    let task = "Find the first failing step in the deploy log.";
+    let history = vec![
+        ToolTurn::User("Hello".into()),
+        ToolTurn::Assistant("Hi, how can I help?".into()),
+        ToolTurn::User(task.into()),
+    ];
+    let run = agent
+        .run(&model, "user", &Mutex::new(Vec::new()), history)
+        .await
+        .unwrap();
+    assert_eq!(run.reply, "Found it.");
+    let last = model.histories_seen().pop().unwrap();
+    assert!(dcpr_agent::estimate_tokens(&last) <= 6_000);
+    assert!(
+        last.iter()
+            .any(|turn| matches!(turn, ToolTurn::User(text) if text == task)),
+        "the task survives compaction: {last:?}"
+    );
+    assert!(last.iter().any(|turn| matches!(
+        turn,
+        ToolTurn::Assistant(text) if text.starts_with("[Earlier ") && text.contains("FIRST LINE page 0")
+    )));
+}
+
+#[tokio::test]
+async fn a_context_overflow_compacts_and_tries_again() {
+    let mut model = ScriptedModel::new();
+    model
+        .push_tool_call("read_log", json!({"page": 1}))
+        .push_tool_call("read_log", json!({"page": 2}))
+        .push_error(dcpr_llm::Error::context_overflow(
+            "maximum context length exceeded",
+        ))
+        .push_text("Done.");
+    let agent = ToolAgent::new("Read logs.", vec![Box::new(ReadLog) as Box<dyn Tool<App>>])
+        .with_tool_output_limit(None)
+        .with_compactor(dcpr_agent::HistoryCompactor::new(1_000_000).keep_recent_exchanges(1));
+    let run = agent
+        .run(
+            &model,
+            "user",
+            &Mutex::new(Vec::new()),
+            vec![ToolTurn::User("Check.".into())],
+        )
+        .await
+        .unwrap();
+    assert_eq!(run.reply, "Done.");
+    let histories = model.histories_seen();
+    let before = dcpr_agent::estimate_tokens(&histories[2]);
+    let after = dcpr_agent::estimate_tokens(&histories[3]);
+    assert!(after <= before / 2, "{before} -> {after}");
+}

@@ -361,6 +361,13 @@ pub trait Tool<R: Runtime>: Send + Sync {
         &[]
     }
 
+    /// Most characters of this tool's rendered output the model sees; the
+    /// rest is cut from the middle with [`cap_output`](crate::cap_output).
+    /// `None` uses the agent's limit.
+    fn output_limit(&self) -> Option<usize> {
+        None
+    }
+
     /// Named run scopes this tool opts into. A host can restrict an unattended
     /// run to the tools carrying its scope. Empty by default.
     fn scopes(&self) -> &'static [&'static str] {

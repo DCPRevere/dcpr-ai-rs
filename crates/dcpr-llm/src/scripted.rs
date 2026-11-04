@@ -4,9 +4,11 @@ use async_trait::async_trait;
 use std::collections::VecDeque;
 use std::sync::Mutex;
 
-use crate::{ChatModel, ChatStep, Error, Result, SystemPrompt, ToolCall, ToolTurn};
+use crate::{ChatModel, ChatStep, Completion, Error, Result, SystemPrompt, ToolCall, ToolTurn};
 
 /// Replays a fixed script of [`ChatStep`]s, one per `chat_step` call.
+/// [`complete`](ChatModel::complete) calls take the next scripted step too,
+/// which must be text or an error.
 ///
 /// Build it with the `push_*` methods. It panics if the conversation asks for
 /// more steps than were scripted, which means the test is wrong or the loop
@@ -18,6 +20,7 @@ pub struct ScriptedModel {
     systems_seen: Mutex<Vec<String>>,
     cacheable_prefix_lengths_seen: Mutex<Vec<usize>>,
     histories_seen: Mutex<Vec<Vec<ToolTurn>>>,
+    completions_seen: Mutex<Vec<(String, String)>>,
 }
 
 impl ScriptedModel {
@@ -28,6 +31,7 @@ impl ScriptedModel {
             systems_seen: Mutex::new(Vec::new()),
             cacheable_prefix_lengths_seen: Mutex::new(Vec::new()),
             histories_seen: Mutex::new(Vec::new()),
+            completions_seen: Mutex::new(Vec::new()),
         }
     }
 
@@ -92,6 +96,11 @@ impl ScriptedModel {
         self.cacheable_prefix_lengths_seen.lock().unwrap().clone()
     }
 
+    /// The (system, user) text of each completion.
+    pub fn completions_seen(&self) -> Vec<(String, String)> {
+        self.completions_seen.lock().unwrap().clone()
+    }
+
     /// Conversation history sent on each step.
     pub fn histories_seen(&self) -> Vec<Vec<ToolTurn>> {
         self.histories_seen.lock().unwrap().clone()
@@ -134,10 +143,29 @@ impl<C: ?Sized + Sync> ChatModel<C> for ScriptedModel {
                 .map(str::to_owned)
                 .collect(),
         );
+        self.next_step()
+    }
+
+    async fn complete(&self, _caller: &C, request: Completion<'_>) -> Result<String> {
+        self.completions_seen
+            .lock()
+            .unwrap()
+            .push((request.system.to_string(), request.user.to_string()));
+        match self.next_step()? {
+            ChatStep::Text(text) => Ok(text.trim().to_string()),
+            ChatStep::ToolCalls(_) => {
+                panic!("ScriptedModel: a completion took a scripted tool-call step")
+            }
+        }
+    }
+}
+
+impl ScriptedModel {
+    fn next_step(&self) -> Result<ChatStep> {
         self.steps.lock().unwrap().pop_front().unwrap_or_else(|| {
             panic!(
                 "ScriptedModel ran out of scripted steps: the conversation asked for more \
-                 chat_step calls than were pushed. Script another step, or the loop is \
+                 model calls than were pushed. Script another step, or the loop is \
                  not terminating."
             )
         })

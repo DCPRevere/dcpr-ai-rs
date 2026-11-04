@@ -7,9 +7,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::{
-    Flow, LoopEvent, Runtime, SharedCall, StepInfo, StepRequest, Tool, ToolConcurrency,
-    ToolOutcomeStatus, ToolResult, TurnLimits, TurnPolicy, call_shared, find, run_turn,
+    Flow, HistoryCompactor, LoopEvent, Runtime, SharedCall, StepInfo, StepRequest, Tool,
+    ToolConcurrency, ToolOutcomeStatus, ToolResult, TurnLimits, TurnPolicy, call_shared,
+    cap_output, estimate_tokens, find, run_turn,
 };
+
+/// Default cap on one tool output, in characters (about 4,000 tokens).
+pub const DEFAULT_TOOL_OUTPUT_CHARS: usize = 16_000;
 
 /// A completed call, as executed this turn.
 #[derive(Debug, Clone)]
@@ -45,11 +49,19 @@ impl<X> AgentRun<X> {
 /// [`ToolOutcomeStatus::Reused`] status instead of running again; a successful
 /// action clears cached reads, since state may have changed. On the last step
 /// tools are withdrawn and the model is asked for a final answer.
+///
+/// Each tool output the model sees is capped, keeping its start and end (see
+/// [`with_tool_output_limit`](Self::with_tool_output_limit)). With
+/// [`with_history_budget`](Self::with_history_budget) the history is compacted
+/// before each step, keeping the user's request, and a context overflow
+/// compacts harder and tries again.
 pub struct ToolAgent<R: Runtime> {
     system: String,
     tools: Vec<Box<dyn Tool<R>>>,
     max_steps: usize,
     timeout: Option<std::time::Duration>,
+    output_limit: Option<usize>,
+    compactor: Option<HistoryCompactor>,
 }
 
 impl<R: Runtime> ToolAgent<R> {
@@ -59,7 +71,28 @@ impl<R: Runtime> ToolAgent<R> {
             tools,
             max_steps: 10,
             timeout: None,
+            output_limit: Some(DEFAULT_TOOL_OUTPUT_CHARS),
+            compactor: None,
         }
+    }
+
+    /// Most characters of one tool output the model sees, unless the tool
+    /// sets its own [`Tool::output_limit`]. Defaults to
+    /// [`DEFAULT_TOOL_OUTPUT_CHARS`]; `None` sends outputs whole.
+    pub fn with_tool_output_limit(mut self, chars: Option<usize>) -> Self {
+        self.output_limit = chars;
+        self
+    }
+
+    /// Compact the history before any step whose estimate exceeds `tokens`.
+    /// See [`HistoryCompactor`].
+    pub fn with_history_budget(self, tokens: usize) -> Self {
+        self.with_compactor(HistoryCompactor::new(tokens))
+    }
+
+    pub fn with_compactor(mut self, compactor: HistoryCompactor) -> Self {
+        self.compactor = Some(compactor);
+        self
     }
 
     /// Model steps allowed per turn. Defaults to 10.
@@ -125,10 +158,16 @@ impl<R: Runtime> ToolAgent<R> {
         C: ?Sized + Sync,
         M: ChatModel<C> + ?Sized,
     {
+        // The request that started this turn, pinned through compaction.
+        let task = history
+            .iter()
+            .rposition(|turn| matches!(turn, ToolTurn::User(_) | ToolTurn::UserWithImages(..)));
         let mut policy = Policy {
             sink,
             agent: self,
             ctx,
+            task,
+            overflow_retries: 0,
             specs: self.tools.iter().map(|t| t.spec()).collect(),
             calls: Vec::new(),
             reads: HashMap::new(),
@@ -176,6 +215,8 @@ struct Policy<'a, R: Runtime> {
     actions: HashMap<String, String>,
     steps: usize,
     sink: Option<Arc<dyn TextStreamSink>>,
+    task: Option<usize>,
+    overflow_retries: usize,
 }
 
 fn call_key(name: &str, args: &serde_json::Value) -> String {
@@ -183,6 +224,38 @@ fn call_key(name: &str, args: &serde_json::Value) -> String {
 }
 
 impl<R: Runtime> Policy<'_, R> {
+    /// What the model sees of a result: its rendering, with the output
+    /// capped first so the envelope stays whole.
+    fn render(&self, tool: Option<&dyn Tool<R>>, result: &ToolResult<R::Extra>) -> String {
+        let limit = tool
+            .and_then(Tool::output_limit)
+            .or(self.agent.output_limit);
+        match limit.map(|limit| cap_output(&result.output, limit)) {
+            Some(std::borrow::Cow::Owned(output)) => {
+                let mut capped = result.clone();
+                capped.output = output;
+                capped.for_model()
+            }
+            _ => result.for_model(),
+        }
+    }
+
+    fn compact(&mut self, history: &mut Vec<ToolTurn>, compactor: &HistoryCompactor) -> bool {
+        let report = compactor.compact(history, self.task);
+        self.task = report.task_index;
+        if report.changed() {
+            tracing::info!(
+                tokens_before = report.tokens_before,
+                tokens_after = report.tokens_after,
+                capped = report.capped_outputs,
+                folded = report.folded_exchanges,
+                digested = report.digested_turns,
+                "compacted the turn history"
+            );
+        }
+        report.changed()
+    }
+
     async fn execute(&mut self, call: &ToolCall) -> (ToolCall, ToolResult<R::Extra>) {
         let Some(tool) = find(&self.agent.tools, &call.name) else {
             let valid = self
@@ -242,7 +315,7 @@ impl<R: Runtime> Policy<'_, R> {
                 )
             }
         };
-        let rendered = result.for_model();
+        let rendered = self.render(Some(tool), &result);
         if tool.is_action() {
             if result.changed() {
                 self.reads.clear();
@@ -268,12 +341,14 @@ impl<R: Runtime> Policy<'_, R> {
         history.push(ToolTurn::AssistantToolCalls(
             executed.iter().map(|(c, _)| c.clone()).collect(),
         ));
-        history.push(ToolTurn::ToolResults(
-            executed
-                .iter()
-                .map(|(c, r)| (c.id.clone(), r.for_model()))
-                .collect(),
-        ));
+        let results = executed
+            .iter()
+            .map(|(c, r)| {
+                let tool = find(&self.agent.tools, &c.name);
+                (c.id.clone(), self.render(tool, r))
+            })
+            .collect();
+        history.push(ToolTurn::ToolResults(results));
         self.calls.extend(
             executed
                 .into_iter()
@@ -293,6 +368,9 @@ impl<C: ?Sized + Sync, R: Runtime> TurnPolicy<C> for Policy<'_, R> {
         history: &mut Vec<ToolTurn>,
     ) -> Result<StepRequest, Self::Error> {
         self.steps = step.number();
+        if let Some(compactor) = &self.agent.compactor {
+            self.compact(history, &compactor.clone());
+        }
         if step.is_last() && !self.calls.is_empty() {
             history.push(ToolTurn::User(
                 "Give the user one final answer now. Use the tool results above and do not claim anything they did not establish."
@@ -372,8 +450,8 @@ impl<C: ?Sized + Sync, R: Runtime> TurnPolicy<C> for Policy<'_, R> {
                         format!("{} failed: {error}", call.name),
                     ),
                 };
-                self.reads
-                    .insert(call_key(&call.name, args), result.for_model());
+                let rendered = self.render(Some(*tool), &result);
+                self.reads.insert(call_key(&call.name, args), rendered);
                 executed.push((
                     ToolCall {
                         arguments: args.clone(),
@@ -392,6 +470,28 @@ impl<C: ?Sized + Sync, R: Runtime> TurnPolicy<C> for Policy<'_, R> {
         };
         self.record(executed, history);
         Ok(Flow::Continue)
+    }
+
+    async fn on_model_error(
+        &mut self,
+        _step: StepInfo,
+        error: dcpr_llm::Error,
+        history: &mut Vec<ToolTurn>,
+    ) -> Result<Flow<Self::Output>, Self::Error> {
+        // A context overflow: compact to half the current size and try once
+        // more, when there is a budget to compact with.
+        if error.is_context_overflow()
+            && self.overflow_retries == 0
+            && let Some(compactor) = &self.agent.compactor
+        {
+            let mut tighter = compactor.clone();
+            tighter.max_tokens = tighter.max_tokens.min(estimate_tokens(history) / 2);
+            self.overflow_retries += 1;
+            if self.compact(history, &tighter) {
+                return Ok(Flow::Continue);
+            }
+        }
+        Err(error.into())
     }
 
     fn observe(&mut self, event: LoopEvent<'_>) {

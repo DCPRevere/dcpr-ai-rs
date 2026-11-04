@@ -6,8 +6,14 @@
 //! refusals become errors, and tool calls are parsed. Batches run at a
 //! discount, in up to 24 hours, on endpoints that implement the OpenAI Batch
 //! API. OpenRouter does not.
+//!
+//! A client on the Responses API (the default on OpenAI, see
+//! [`OpenAiCompat::with_responses_api`]) builds tool steps for
+//! the `/v1/responses` batch endpoint, which OpenAI's gpt-6 models need for
+//! function tools. One batch holds one endpoint, so keep those steps apart from
+//! completions, which always use Chat Completions.
 
-use super::{OpenAiCompat, interpret_tool_message};
+use super::{OpenAiCompat, interpret_responses_payload, interpret_tool_message};
 use crate::{Caller, ChatStep, Completion, Error, Result, SystemPrompt, ToolTurn};
 use async_openai::config::OpenAIConfig;
 use async_openai::error::OpenAIError;
@@ -21,20 +27,30 @@ use serde_json::{Value, json};
 use std::time::Duration;
 
 const ENDPOINT: &str = "/v1/chat/completions";
+const RESPONSES_ENDPOINT: &str = "/v1/responses";
 
 /// One request in a batch: a caller-chosen id and the request body.
 #[derive(Debug, Clone)]
 pub struct BatchRequest {
     pub custom_id: String,
     body: Value,
+    responses: bool,
 }
 
 impl BatchRequest {
-    fn line(&self) -> Value {
+    fn url(&self) -> &'static str {
+        if self.responses {
+            RESPONSES_ENDPOINT
+        } else {
+            ENDPOINT
+        }
+    }
+
+    pub(super) fn line(&self) -> Value {
         json!({
             "custom_id": self.custom_id,
             "method": "POST",
-            "url": ENDPOINT,
+            "url": self.url(),
             "body": self.body,
         })
     }
@@ -182,11 +198,13 @@ impl<C: Caller + ?Sized> OpenAiCompat<C> {
         BatchRequest {
             custom_id: custom_id.into(),
             body: self.completion_body(caller, &request),
+            responses: false,
         }
     }
 
-    /// A tool step to add to a batch, built as a Chat Completions
-    /// [`ChatModel::chat_step`](crate::ChatModel::chat_step) builds it. A
+    /// A tool step to add to a batch, built as
+    /// [`ChatModel::chat_step`](crate::ChatModel::chat_step) builds it: on
+    /// the Responses API when the client uses it, else Chat Completions. A
     /// batch has no second attempt, so a failed reasoning step is not retried
     /// without reasoning.
     pub fn batch_step(
@@ -197,11 +215,17 @@ impl<C: Caller + ?Sized> OpenAiCompat<C> {
         history: &[ToolTurn],
         tools: &[Value],
     ) -> BatchRequest {
-        let (_, mut body) = self.chat_step_base(caller, system, history, tools);
-        self.apply_provider_quirks(&mut body, self.chat_step_reasoning(history));
+        let reasoning = self.chat_step_reasoning(history);
+        let mut body = if self.uses_responses() {
+            self.responses_base(caller, system, history, tools).body
+        } else {
+            self.chat_step_base(caller, system, history, tools).1
+        };
+        self.apply_provider_quirks(&mut body, reasoning);
         BatchRequest {
             custom_id: custom_id.into(),
             body,
+            responses: self.uses_responses(),
         }
     }
 
@@ -209,6 +233,15 @@ impl<C: Caller + ?Sized> OpenAiCompat<C> {
     pub async fn submit_batch(&self, requests: &[BatchRequest]) -> Result<BatchJob> {
         if requests.is_empty() {
             return Err(Error::hard("a batch needs at least one request"));
+        }
+        let responses = requests[0].responses;
+        if requests
+            .iter()
+            .any(|request| request.responses != responses)
+        {
+            return Err(Error::hard(
+                "a batch holds one endpoint: submit Responses tool steps and Chat Completions requests separately",
+            ));
         }
         let mut seen = std::collections::HashSet::new();
         if let Some(duplicate) = requests.iter().find(|r| !seen.insert(&r.custom_id)) {
@@ -241,7 +274,11 @@ impl<C: Caller + ?Sized> OpenAiCompat<C> {
             .batches()
             .create(CreateBatch {
                 input_file_id: file.id,
-                endpoint: BatchEndpoint::V1ChatCompletions,
+                endpoint: if responses {
+                    BatchEndpoint::V1Responses
+                } else {
+                    BatchEndpoint::V1ChatCompletions
+                },
                 completion_window: BatchCompletionWindow::W24H,
                 metadata: None,
                 output_expires_after: None,
@@ -331,6 +368,16 @@ impl<C: Caller + ?Sized> OpenAiCompat<C> {
                 ));
             }
             let model = body["model"].as_str().unwrap_or(&self.model).to_string();
+            if body["object"] == "response" || body.get("output").is_some() {
+                let payload = self.finish_responses_payload(
+                    caller,
+                    &model,
+                    body,
+                    None,
+                    std::time::Instant::now(),
+                )?;
+                return Ok(interpret_responses_payload(&payload));
+            }
             let raw = body.to_string();
             let message = self.finish_chat_payload(
                 caller,

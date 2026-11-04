@@ -8,17 +8,22 @@
 //!   happen.
 //! - [`run_turn`] drives a turn and hands every decision to a [`TurnPolicy`].
 //! - [`ToolAgent`] is a ready-made policy for the common case.
+//! - [`HistoryCompactor`] keeps a long turn inside the context window without
+//!   losing the task, and [`cap_output`] shortens one tool output to its start
+//!   and end.
 //! - `mcp` (feature `mcp`) bridges tools to and from MCP servers through
 //!   `rmcp`, the official Rust SDK.
 
 mod agent;
+mod history;
 #[cfg(feature = "mcp")]
 pub mod mcp;
 mod schema;
 mod tool;
 mod turn;
 
-pub use agent::{AgentError, AgentRun, ExecutedCall, ToolAgent};
+pub use agent::{AgentError, AgentRun, DEFAULT_TOOL_OUTPUT_CHARS, ExecutedCall, ToolAgent};
+pub use history::{CompactionReport, HistoryCompactor, cap_output, estimate_tokens, turn_tokens};
 pub use schema::{
     coerce_args_to_schema, decode_typed_args, prepare_typed_args, typed_parameters,
     validate_args_against_schema,

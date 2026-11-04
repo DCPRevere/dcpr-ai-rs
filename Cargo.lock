@@ -349,7 +349,7 @@ dependencies = [
 
 [[package]]
 name = "dcpr-agent"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "dcpr-llm",
@@ -364,7 +364,7 @@ dependencies = [
 
 [[package]]
 name = "dcpr-llm"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-openai",
  "async-trait",

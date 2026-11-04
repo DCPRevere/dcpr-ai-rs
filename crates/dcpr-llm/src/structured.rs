@@ -24,6 +24,95 @@ pub fn json_schema_for<T: JsonSchema>() -> Value {
     schema
 }
 
+/// The schema for `T` in the form strict structured output requires (OpenAI
+/// `strict: true`, and Anthropic's compatible endpoint, which accepts only
+/// strict schemas): every object lists all its properties in `required` and
+/// sets `additionalProperties: false`. A property that was optional becomes
+/// nullable instead, so `Option` fields still decode. Numeric bounds and
+/// formats (`minimum`, `format: uint32` and so on) are dropped, because
+/// Anthropic rejects them; decoding into `T` still enforces them.
+pub fn strict_json_schema_for<T: JsonSchema>() -> Value {
+    let mut schema = json_schema_for::<T>();
+    make_strict(&mut schema);
+    schema
+}
+
+fn make_strict(schema: &mut Value) {
+    let Some(object) = schema.as_object_mut() else {
+        return;
+    };
+    for key in [
+        "minimum",
+        "maximum",
+        "exclusiveMinimum",
+        "exclusiveMaximum",
+        "multipleOf",
+        "format",
+    ] {
+        object.remove(key);
+    }
+    let required: std::collections::HashSet<String> = object
+        .get("required")
+        .and_then(Value::as_array)
+        .map(|names| {
+            names
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    if let Some(Value::Object(properties)) = object.get_mut("properties") {
+        for (name, property) in properties.iter_mut() {
+            if !required.contains(name) {
+                make_nullable(property);
+            }
+            make_strict(property);
+        }
+        let names: Vec<Value> = properties.keys().cloned().map(Value::String).collect();
+        object.insert("required".into(), Value::Array(names));
+        object.insert("additionalProperties".into(), Value::Bool(false));
+    } else if object.get("type").and_then(Value::as_str) == Some("object") {
+        object.insert("additionalProperties".into(), Value::Bool(false));
+    }
+    for key in ["items", "additionalItems", "not"] {
+        if let Some(inner) = object.get_mut(key) {
+            make_strict(inner);
+        }
+    }
+    for key in ["anyOf", "oneOf", "allOf", "prefixItems"] {
+        if let Some(Value::Array(variants)) = object.get_mut(key) {
+            variants.iter_mut().for_each(make_strict);
+        }
+    }
+    for key in ["$defs", "definitions"] {
+        if let Some(Value::Object(defs)) = object.get_mut(key) {
+            defs.values_mut().for_each(make_strict);
+        }
+    }
+}
+
+fn make_nullable(schema: &mut Value) {
+    let null = Value::String("null".into());
+    match schema.get_mut("type") {
+        Some(Value::String(kind)) if kind != "null" => {
+            let kind = Value::String(kind.clone());
+            schema["type"] = Value::Array(vec![kind, null]);
+        }
+        Some(Value::Array(kinds)) if !kinds.contains(&null) => kinds.push(null),
+        Some(_) => {}
+        None => {
+            if let Some(Value::Array(variants)) = schema.get_mut("anyOf") {
+                if !variants.iter().any(|v| v["type"] == "null") {
+                    variants.push(serde_json::json!({"type": "null"}));
+                }
+            } else {
+                *schema = serde_json::json!({"anyOf": [schema.clone(), {"type": "null"}]});
+            }
+        }
+    }
+}
+
 /// Ask `model` for a reply shaped like `T` and decode it.
 ///
 /// The schema is derived from `T` and sent as `response_format: json_schema`.
@@ -63,6 +152,31 @@ where
     let schema = json_schema_for::<T>();
     let name = schema_name::<T>();
     let request = Completion::new(system, user, max_tokens).with_schema(&name, &schema);
+    let reply = model.complete(caller, request).await?;
+    decode_json(&reply)
+}
+
+/// Like [`complete_typed`], with the provider enforcing the schema exactly
+/// ([`strict_json_schema_for`] and `strict: true`). Use it on OpenAI, where it
+/// guarantees the shape, and on Anthropic's compatible endpoint, which accepts
+/// nothing else.
+pub async fn complete_typed_strict<T, C, M>(
+    model: &M,
+    caller: &C,
+    system: &str,
+    user: &str,
+    max_tokens: u32,
+) -> Result<T>
+where
+    T: DeserializeOwned + JsonSchema,
+    C: ?Sized + Sync,
+    M: ChatModel<C> + ?Sized,
+{
+    let schema = strict_json_schema_for::<T>();
+    let name = schema_name::<T>();
+    let request = Completion::new(system, user, max_tokens)
+        .with_schema(&name, &schema)
+        .strict();
     let reply = model.complete(caller, request).await?;
     decode_json(&reply)
 }
@@ -119,6 +233,51 @@ mod tests {
         assert_eq!(schema["properties"]["bed"]["type"], "integer");
         assert_eq!(schema_name::<Harvest>(), "Harvest");
         assert_eq!(schema_name::<Vec<Harvest>>(), "Vec");
+    }
+
+    #[derive(Debug, PartialEq, serde::Deserialize, schemars::JsonSchema)]
+    struct Plan {
+        bed: u32,
+        note: Option<String>,
+        steps: Vec<Step>,
+    }
+
+    #[derive(Debug, PartialEq, serde::Deserialize, schemars::JsonSchema)]
+    struct Step {
+        action: String,
+        minutes: Option<u32>,
+    }
+
+    #[test]
+    fn strict_schemas_require_every_property_and_close_every_object() {
+        let schema = strict_json_schema_for::<Plan>();
+        fn check(schema: &Value) {
+            if let Some(properties) = schema.get("properties").and_then(Value::as_object) {
+                assert_eq!(schema["additionalProperties"], false, "{schema}");
+                let required = schema["required"].as_array().unwrap();
+                assert_eq!(required.len(), properties.len(), "{schema}");
+                properties.values().for_each(check);
+            }
+            if let Some(items) = schema.get("items") {
+                check(items);
+            }
+            for variants in ["anyOf", "oneOf"] {
+                schema[variants]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .for_each(check);
+            }
+        }
+        check(&schema);
+        assert!(!schema.to_string().contains("minimum"), "{schema}");
+        // An optional field may now be null, and still decodes when it is.
+        assert!(schema["properties"]["note"].to_string().contains("null"));
+        let plan: Plan = decode_json(
+            r#"{"bed": 2, "note": null, "steps": [{"action": "water", "minutes": null}]}"#,
+        )
+        .unwrap();
+        assert_eq!(plan.steps[0].minutes, None);
     }
 
     #[test]
