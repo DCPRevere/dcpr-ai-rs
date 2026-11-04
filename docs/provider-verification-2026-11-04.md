@@ -8,11 +8,7 @@ streamed), streamed text and tools, an image, a bad key and a bad model.
 Extra scenarios ran for the new features: strict typed output, pricing, and
 model-written compaction.
 
-Keys used: OpenAI `xml/openai/…/keys/opsclaw` (the `openai/api-key/logseq` key
-has no credit), OpenRouter `openrouter/keys/gianna` (`opencode`, `opsclaw`
-and `hermes` return 401 "User not found"), Gemini `ai/gemini/api-key/2`
-(key 1 is out of free quota), Anthropic `anthropic/keys/zeroclaw`, and local
-Ollama.
+Each provider was called with an ordinary API key; Ollama ran locally.
 
 ## Before and after (passing scenarios out of 19)
 
