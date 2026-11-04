@@ -8,8 +8,12 @@
 //!   happen.
 //! - [`run_turn`] drives a turn and hands every decision to a [`TurnPolicy`].
 //! - [`ToolAgent`] is a ready-made policy for the common case.
+//! - `mcp` (feature `mcp`) bridges tools to and from MCP servers through
+//!   `rmcp`, the official Rust SDK.
 
 mod agent;
+#[cfg(feature = "mcp")]
+pub mod mcp;
 mod schema;
 mod tool;
 mod turn;

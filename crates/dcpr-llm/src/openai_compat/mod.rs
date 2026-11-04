@@ -14,11 +14,15 @@ use serde_json::{Value, json};
 use std::sync::Arc;
 
 mod anthropic;
+#[cfg(feature = "batch")]
+mod batch;
 use crate::{
     Caller, ChatModel, ChatStep, Completion, StopReason, SystemPrompt, TextStreamSink, ToolCall,
     ToolTurn, Usage, UsageSink,
 };
 use crate::{Error, Result};
+#[cfg(feature = "batch")]
+pub use batch::{BatchItem, BatchJob, BatchRequest, BatchStatus};
 
 /// Whole interactive turns have their own shorter deadline. Do not repeatedly
 /// abort and restart a progressing reasoning stream before that deadline.
@@ -1183,15 +1187,15 @@ impl<C: Caller + ?Sized> OpenAiCompat<C> {
         Ok(step)
     }
 
-    async fn complete_request(&self, caller: &C, request: Completion<'_>) -> Result<String> {
+    /// The Chat Completions body for a one-shot completion.
+    fn completion_body(&self, caller: &C, request: &Completion<'_>) -> Value {
         let Completion {
             system,
             user,
             max_tokens,
             json_object,
             schema,
-        } = request;
-        let _permit = self.permit().await;
+        } = *request;
         let mut body = json!({
             "model": self.model,
             "max_tokens": max_tokens,
@@ -1229,6 +1233,12 @@ impl<C: Caller + ?Sized> OpenAiCompat<C> {
             // schema is never silently ignored.
             body["provider"]["require_parameters"] = json!(true);
         }
+        body
+    }
+
+    async fn complete_request(&self, caller: &C, request: Completion<'_>) -> Result<String> {
+        let _permit = self.permit().await;
+        let body = self.completion_body(caller, &request);
 
         let req = self.post("chat/completions");
 
@@ -1352,15 +1362,15 @@ impl<C: Caller + ?Sized> OpenAiCompat<C> {
 }
 
 impl<C: Caller + ?Sized> OpenAiCompat<C> {
-    /// One Chat Completions tool step, streamed to `sink` when one is given.
-    async fn chat_completions_chat_step(
+    /// The Chat Completions model and body for a tool step, before reasoning
+    /// and provider quirks.
+    fn chat_step_base(
         &self,
         caller: &C,
         system: SystemPrompt<'_>,
         history: &[ToolTurn],
         tools: &[Value],
-        sink: Option<Arc<dyn TextStreamSink>>,
-    ) -> Result<ChatStep> {
+    ) -> (String, Value) {
         // Build the OpenAI messages array from the turn history.
         let mut messages: Vec<Value> =
             vec![json!({ "role": "system", "content": system.as_str() })];
@@ -1418,7 +1428,7 @@ impl<C: Caller + ?Sized> OpenAiCompat<C> {
         // guess argument names.
         let oai_tools: Vec<Value> = tools.iter().map(oai_function).collect();
 
-        let model = self.model_for(history);
+        let model = self.model_for(history).to_string();
         // No-tool calls are small structured helpers such as classification
         // and extraction. They return a few fields of JSON and must not inherit
         // a large ceiling: a huge ceiling let a malformed reviewer ramble until
@@ -1437,6 +1447,32 @@ impl<C: Caller + ?Sized> OpenAiCompat<C> {
             "tools": oai_tools,
         });
         self.apply_openrouter_session(&mut base, &caller.scope(), "user");
+        (model, base)
+    }
+
+    /// The reasoning setting for a tool step. Image turns never reason.
+    fn chat_step_reasoning(&self, history: &[ToolTurn]) -> Option<&str> {
+        let has_images = history
+            .iter()
+            .any(|t| matches!(t, ToolTurn::UserWithImages(_, images) if !images.is_empty()));
+        if has_images {
+            None
+        } else {
+            self.step_reasoning()
+        }
+    }
+
+    /// One Chat Completions tool step, streamed to `sink` when one is given.
+    async fn chat_completions_chat_step(
+        &self,
+        caller: &C,
+        system: SystemPrompt<'_>,
+        history: &[ToolTurn],
+        tools: &[Value],
+        sink: Option<Arc<dyn TextStreamSink>>,
+    ) -> Result<ChatStep> {
+        let (model, base) = self.chat_step_base(caller, system, history, tools);
+        let model = model.as_str();
 
         // Attempt 1 carries the configured reasoning effort for text turns.
         // Vision models are configured independently and may reject reasoning,
@@ -1448,14 +1484,7 @@ impl<C: Caller + ?Sized> OpenAiCompat<C> {
         // reply and `content` is empty), the SAME turn is re-sent once with
         // reasoning disabled. The privacy floor is never traded away —
         // only the effort is. A failure of BOTH attempts propagates normally.
-        let has_images = history
-            .iter()
-            .any(|t| matches!(t, ToolTurn::UserWithImages(_, images) if !images.is_empty()));
-        let reasoning = if has_images {
-            None
-        } else {
-            self.step_reasoning()
-        };
+        let reasoning = self.chat_step_reasoning(history);
         let mut body = base.clone();
         self.apply_provider_quirks(&mut body, reasoning);
         let mut msg = self

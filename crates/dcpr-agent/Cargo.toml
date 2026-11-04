@@ -11,6 +11,10 @@ readme = "../../README.md"
 keywords = ["llm", "agents", "tool-calling", "json-schema"]
 categories = ["asynchronous"]
 
+[features]
+# Bridge tools to and from MCP servers through rmcp.
+mcp = ["dep:rmcp"]
+
 [dependencies]
 async-trait.workspace = true
 dcpr-llm.workspace = true
@@ -20,6 +24,15 @@ serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+rmcp = { workspace = true, features = ["client", "server"], optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
+rmcp = { workspace = true, features = ["client", "server", "transport-child-process"] }
+
+[[test]]
+name = "mcp"
+required-features = ["mcp"]
+
+[package.metadata.docs.rs]
+all-features = true

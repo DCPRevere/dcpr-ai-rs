@@ -12,6 +12,8 @@
 //!   models.
 //! - [`complete_typed`] asks for a reply matching a JSON Schema derived from a
 //!   Rust type, and decodes it.
+//! - Batch API support (feature `batch`) builds batched requests exactly as
+//!   live ones and reads replies back through the same checks.
 //! - [`ScriptedModel`] replays a fixed script of steps for deterministic tests.
 //!
 //! Callers are generic. A [`Caller`] says who a request is for, so usage can be
@@ -30,6 +32,8 @@ mod usage;
 pub use error::{Error, Result, StopReason, is_context_overflow_body};
 pub use fallback::{ChainHealth, Fallback, Retryable};
 pub use model::{Caller, ChatModel, Completion, ResponseSchema};
+#[cfg(feature = "batch")]
+pub use openai_compat::{BatchItem, BatchJob, BatchRequest, BatchStatus};
 pub use openai_compat::{OpenAiCompat, OpenRouterProviderSort, RequestSize, parse_retry_after};
 pub use scripted::ScriptedModel;
 pub use structured::{complete_typed, decode_json, json_schema_for};

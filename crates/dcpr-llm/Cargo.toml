@@ -11,6 +11,10 @@ readme = "../../README.md"
 keywords = ["llm", "openrouter", "openai", "agents", "tool-calling"]
 categories = ["api-bindings", "asynchronous"]
 
+[features]
+# The OpenAI Batch API, through async-openai.
+batch = ["dep:async-openai"]
+
 [dependencies]
 async-trait.workspace = true
 futures.workspace = true
@@ -23,8 +27,12 @@ sha2.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+async-openai = { workspace = true, features = ["batch", "file"], optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
 wiremock.workspace = true
 axum = "0.8"
+
+[package.metadata.docs.rs]
+all-features = true
