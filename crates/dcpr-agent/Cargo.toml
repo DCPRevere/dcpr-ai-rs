@@ -1,0 +1,25 @@
+[package]
+name = "dcpr-agent"
+description = "A typed tool contract and a hookable tool-calling loop for LLM agents."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+keywords = ["llm", "agents", "tool-calling", "json-schema"]
+categories = ["asynchronous"]
+
+[dependencies]
+async-trait.workspace = true
+dcpr-llm.workspace = true
+futures.workspace = true
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
