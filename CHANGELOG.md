@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.3.0 (unreleased)
+## 0.3.0 (2026-11-04)
 
 Works against OpenAI directly, and is verified live against OpenAI,
 OpenRouter, Anthropic's and Gemini's OpenAI-compatible endpoints, and Ollama.
